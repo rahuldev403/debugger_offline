@@ -547,6 +547,9 @@ st.markdown("""
 
 def parse_error_type(error_log: str) -> str:
     """Extract error type from stack trace."""
+    if not error_log or not error_log.strip():
+        return "UnknownError"
+    
     error_patterns = [
         r"(\w+Error):", r"(\w+Exception):", r"(\w+Warning):"
     ]
@@ -554,6 +557,15 @@ def parse_error_type(error_log: str) -> str:
         match = re.search(pattern, error_log)
         if match:
             return match.group(1)
+    
+    # Check for specific error messages
+    if "TIMEOUT" in error_log.upper():
+        return "TimeoutError"
+    if "137" in error_log or "Out of Memory" in error_log:
+        return "MemoryError"
+    if "No module named" in error_log:
+        return "ModuleNotFoundError"
+    
     return "RuntimeError"
 
 def extract_logs_from_output(output: str) -> List[str]:
@@ -620,7 +632,7 @@ def format_diff_html(diff_text: str) -> str:
 # --- DOCKER SANDBOX EXECUTION ---
 
 def run_in_docker(code: str) -> ExecutionTrace:
-    """Execute Python code in a Docker sandbox with full trace capture."""
+    """Execute Python code in a Docker sandbox with strict security constraints."""
     start_time = time.time()
     trace = ExecutionTrace(
         iteration=0,
@@ -637,13 +649,15 @@ def run_in_docker(code: str) -> ExecutionTrace:
     except Exception as e:
         trace.output = f"Failed to write script: {str(e)}"
         trace.error_type = "IOError"
+        trace.execution_time = time.time() - start_time
         return trace
     
     try:
         client = docker.from_env()
     except Exception as e:
-        trace.output = f"Docker Connection Error: Docker Desktop is not running.\n\nPlease ensure Docker Desktop is installed and running, then try again.\n\nTechnical details: {str(e)}"
+        trace.output = f"Docker Error: Docker Desktop is not running.\n{str(e)}"
         trace.error_type = "DockerConnectionError"
+        trace.execution_time = time.time() - start_time
         return trace
     
     container = None
@@ -654,18 +668,34 @@ def run_in_docker(code: str) -> ExecutionTrace:
             "my-safe-sandbox",
             "python /app/user_script.py",
             volumes={cwd: {'bind': '/app', 'mode': 'rw'}},
-            mem_limit="128m",
-            cpu_period=100000,
-            cpu_quota=50000,
-            network_disabled=True,
+            mem_limit="128m",           # CRITICAL: 128MB RAM Limit
+            network_disabled=True,      
             detach=True,
             remove=False
         )
         
         try:
+            # Wait for container to finish
             result = container.wait(timeout=5)
+            
+            # Capture logs (stdout + stderr)
             logs = container.logs().decode('utf-8')
             exit_code = result.get('StatusCode', 1)
+            
+            # Ensure we always have some output to prevent empty trace issues
+            if not logs or not logs.strip():
+                if exit_code == 0:
+                    logs = "Execution completed successfully with no output."
+                else:
+                    logs = f"Process exited with code {exit_code} but produced no output."
+            
+            # --- CRITICAL FIX FOR MEMORY LOOP ---
+            if exit_code == 137:
+                logs += "\n❌ SYSTEM ALERT: Process was killed by the Kernel (Out of Memory)."
+                logs += "\nDiagnosis: The code tried to use more than 128MB of RAM."
+                logs += "\nFix Required: Reduce data size, list size, or use generators."
+            # ------------------------------------
+            
             container.remove()
             
             trace.execution_time = time.time() - start_time
@@ -679,26 +709,28 @@ def run_in_docker(code: str) -> ExecutionTrace:
                 trace.error_type = parse_error_type(logs)
                 trace.stack_trace = logs
                 
-        except Exception:
+        except Exception as timeout_ex:
+            # Handle Timeout (Infinite Loop)
             container.kill()
             container.remove()
-            trace.output = "⏱️ TIMEOUT ERROR\n\nExecution exceeded 5 seconds time limit.\n\nPossible causes:\n• Infinite loop in code\n• Blocking I/O operation\n• Heavy computation\n\nThe sandbox enforces strict time limits for security."
+            trace.output = "TIMEOUT ERROR: Execution exceeded 5 seconds. Possible infinite loop detected."
             trace.error_type = "TimeoutError"
-            trace.execution_time = 5.0
+            trace.execution_time = time.time() - start_time
             
     except docker.errors.ImageNotFound:
-        trace.output = "🐳 Docker Image Not Found\n\nThe sandbox image 'my-safe-sandbox' is not available.\n\nTo build it, run:\n  docker build -t my-safe-sandbox ."
+        trace.output = "Docker Error: Image 'my-safe-sandbox' not found."
         trace.error_type = "ImageNotFoundError"
+        trace.execution_time = time.time() - start_time
     except Exception as e:
         if container:
             try: 
                 container.remove(force=True)
             except: 
                 pass
-        trace.output = f"Unexpected sandbox error: {str(e)}"
+        trace.output = f"Unexpected error: {str(e)}"
         trace.error_type = "SandboxError"
+        trace.execution_time = time.time() - start_time
     
-    trace.execution_time = time.time() - start_time
     return trace
 
 # --- AI FIX GENERATION ---
@@ -748,10 +780,30 @@ def apply_basic_fix(bad_code: str, error_log: str) -> tuple[str, str, str]:
         match = re.search(r"No module named '(\w+)'", error_log)
         if match:
             module = match.group(1)
-            explanation = f"Removed unavailable import '{module}' - rewrite needed"
-            reasoning = f"Module '{module}' is not available in the sandbox environment. External libraries are disabled for security. Code needs to be rewritten using only Python standard library."
+            explanation = f"Replaced {module} functions with standard library equivalents"
+            reasoning = f"Module '{module}' is not available in the sandbox environment. Replacing {module} functions with Python standard library equivalents to maintain functionality."
+            
+            # Remove the import
             fixed_code = re.sub(rf"^import {module}.*$", f"# import {module}  # Unavailable in sandbox", bad_code, flags=re.MULTILINE)
             fixed_code = re.sub(rf"^from {module}.*$", f"# Removed: {module} not available", fixed_code, flags=re.MULTILINE)
+            
+            # Replace common numpy functions (handle both np and numpy)
+            if module == "numpy" or module == "np":
+                # Replace numpy.mean() or np.mean() with sum()/len()
+                fixed_code = re.sub(r'(?:numpy|np)\.mean\(([^)]+)\)', r'sum(\1) / len(\1)', fixed_code)
+                # Replace numpy.sum() or np.sum() with sum()
+                fixed_code = re.sub(r'(?:numpy|np)\.sum\(([^)]+)\)', r'sum(\1)', fixed_code)
+                # Replace numpy.max() or np.max() with max()
+                fixed_code = re.sub(r'(?:numpy|np)\.max\(([^)]+)\)', r'max(\1)', fixed_code)
+                # Replace numpy.min() or np.min() with min()
+                fixed_code = re.sub(r'(?:numpy|np)\.min\(([^)]+)\)', r'min(\1)', fixed_code)
+                # Replace numpy.array() or np.array() with list()
+                fixed_code = re.sub(r'(?:numpy|np)\.array\(([^)]+)\)', r'list(\1)', fixed_code)
+                # Replace numpy.median() or np.median() with statistics.median
+                fixed_code = re.sub(r'(?:numpy|np)\.median\(([^)]+)\)', r'statistics.median(\1)', fixed_code)
+                # Add statistics import if median was used
+                if 'statistics.median' in fixed_code and 'import statistics' not in fixed_code:
+                    fixed_code = 'import statistics\n' + fixed_code
     
     return explanation, fixed_code, reasoning
 
@@ -812,17 +864,33 @@ ENVIRONMENT CONSTRAINTS:
 
 YOUR TASK:
 1. Analyze the error and identify root cause
-2. Provide a complete fix using ONLY standard library
-3. Explain your reasoning step-by-step
+2. Provide a COMPLETE, WORKING fix using ONLY standard library
+3. MAINTAIN THE SAME FUNCTIONALITY - do not simplify or remove logic
+4. Replace external library functions with standard library equivalents
+5. Explain your reasoning step-by-step
+
+CRITICAL REQUIREMENTS:
+- Provide the ENTIRE corrected code, not just a partial fix
+- Preserve all original functionality and logic
+- Replace numpy functions with standard library:
+  * np.mean() → sum() / len()
+  * np.sum() → sum()
+  * np.array() → list()
+  * np.max() → max()
+  * np.min() → min()
+  * etc.
+- Replace pandas functions with standard library equivalents
+- Keep all variables, functions, and print statements intact
+- The fixed code must produce the same output as intended
 
 RESPOND WITH ONLY A VALID JSON OBJECT:
 {
     "explanation": "One sentence describing the bug and fix",
-    "fixed_code": "Complete corrected Python code (no markdown, no backticks)",
+    "fixed_code": "Complete corrected Python code (no markdown, no backticks, preserve all functionality)",
     "reasoning": "Detailed step-by-step analysis of the problem and solution"
 }
 
-IMPORTANT: Return ONLY the JSON object, no additional text."""
+IMPORTANT: Return ONLY the JSON object, no additional text. The fixed_code must be complete and functional."""
 
         user_prompt = f"""BROKEN CODE:
 ```python
@@ -834,7 +902,17 @@ ERROR OUTPUT:
 {error_log}
 ```
 
-Analyze and fix. Return JSON only."""
+CRITICAL INSTRUCTIONS:
+- Provide the COMPLETE fixed code that maintains ALL original functionality
+- Replace external library calls (like np.mean, np.sum, etc.) with standard library equivalents
+- Keep ALL variables, functions, print statements, and logic intact
+- The output should be the same as the original code intended
+- Do NOT simplify or remove functionality - only replace unavailable libraries
+
+Example: If code uses np.mean(numbers), replace with: sum(numbers) / len(numbers)
+Example: If code uses np.sum(array), replace with: sum(array)
+
+Return JSON only with the complete fixed code."""
         
         response = requests.post(
             "http://localhost:11434/api/generate",
@@ -972,7 +1050,7 @@ print(f"Average: {result}")"""
         
         # Configuration
         st.markdown("### Configuration")
-        max_iterations = st.slider("Max Repair Cycles", 1, 10, 5)
+        st.info("🔄 **Unlimited Repair Cycles**\n\nThe system will automatically iterate until the code is fixed.")
         
         st.markdown("---")
         
@@ -1116,12 +1194,15 @@ for i in range(1, 8):
                 )
                 
                 current_code = code_input
+                iteration = 0
                 
-                for iteration in range(1, max_iterations + 1):
+                # Unlimited repair loop - continues until code is fixed
+                while True:
+                    iteration += 1
                     session.total_iterations = iteration
                     
                     # Create iteration card
-                    with st.status(f"🔄 Iteration {iteration}/{max_iterations}", expanded=True) as status:
+                    with st.status(f"🔄 Iteration {iteration} (Unlimited)", expanded=True) as status:
                         
                         # Step 1: Execute
                         st.markdown("**Step 1:** Executing in sandbox...")
@@ -1141,69 +1222,75 @@ for i in range(1, 8):
                             session.success = True
                             session.final_code = current_code
                             st.session_state.repair_session = session
-                            break
+                            break  # Exit loop on success
                         
                         else:
                             status.update(label=f"❌ Iteration {iteration}: Error detected", state="error")
                             
+                            # Ensure we have valid error information
+                            error_type = trace.error_type or "UnknownError"
+                            error_output = trace.output if trace.output and trace.output.strip() else "No error output captured. Execution failed silently."
+                            
                             # Show error details
-                            st.error(f"**{trace.error_type}** detected")
+                            st.error(f"**{error_type}** detected")
                             
                             # Show stack trace directly (no nested expander)
                             st.markdown("**🔍 Stack Trace:**")
-                            st.code(trace.output[:500] + ("..." if len(trace.output) > 500 else ""), language="bash")
+                            display_output = error_output[:500] + ("..." if len(error_output) > 500 else "")
+                            st.code(display_output, language="bash")
                             
-                            # Step 2: AI Analysis
-                            if iteration < max_iterations:
-                                st.markdown("---")
-                                st.markdown("**Step 2:** AI analyzing and generating patch...")
-                                
-                                with st.spinner("🧠 Consulting AI..."):
-                                    explanation, fixed_code, reasoning, ai_time = get_ai_fix(current_code, trace.output)
-                                
-                                # Create patch record
-                                unified_diff = generate_unified_diff(current_code, fixed_code)
-                                line_edits = generate_line_edits(current_code, fixed_code)
-                                
-                                patch = PatchRecord(
-                                    iteration=iteration,
-                                    original_code=current_code,
-                                    fixed_code=fixed_code,
-                                    unified_diff=unified_diff,
-                                    line_edits=line_edits,
-                                    explanation=explanation,
-                                    reasoning=reasoning,
-                                    ai_time=ai_time
-                                )
-                                session.patch_logs.append(patch)
-                                
-                                # Show AI explanation
-                                st.info(f"💡 **Fix:** {explanation}")
-                                st.caption(f"⏱️ AI response time: {ai_time:.2f}s")
-                                
-                                # Show reasoning (collapsed in a details tag via markdown)
-                                st.markdown("**🧠 AI Reasoning:**")
-                                st.markdown(f"> {reasoning[:300]}{'...' if len(reasoning) > 300 else ''}")
-                                
-                                # Show diff
-                                st.markdown("**📋 Patch (Unified Diff):**")
-                                if unified_diff.strip():
-                                    st.code(unified_diff, language="diff")
-                                else:
-                                    st.caption("No changes detected")
-                                
-                                # Show line edit count
-                                st.caption(f"📝 {len(line_edits)} line edit(s) applied")
-                                
-                                # Apply patch
-                                st.markdown("**Step 3:** Applying patch...")
-                                current_code = clean_code_string(fixed_code)
-                                st.success("✅ Patch applied")
-                                
+                            # Step 2: AI Analysis - Always try to fix
+                            st.markdown("---")
+                            st.markdown("**Step 2:** AI analyzing and generating patch...")
+                            
+                            with st.spinner("🧠 Consulting AI..."):
+                                # Ensure we pass valid error output to AI
+                                explanation, fixed_code, reasoning, ai_time = get_ai_fix(current_code, error_output)
+                            
+                            # Create patch record
+                            unified_diff = generate_unified_diff(current_code, fixed_code)
+                            line_edits = generate_line_edits(current_code, fixed_code)
+                            
+                            patch = PatchRecord(
+                                iteration=iteration,
+                                original_code=current_code,
+                                fixed_code=fixed_code,
+                                unified_diff=unified_diff,
+                                line_edits=line_edits,
+                                explanation=explanation,
+                                reasoning=reasoning,
+                                ai_time=ai_time
+                            )
+                            session.patch_logs.append(patch)
+                            
+                            # Show AI explanation
+                            st.info(f"💡 **Fix:** {explanation}")
+                            st.caption(f"⏱️ AI response time: {ai_time:.2f}s")
+                            
+                            # Show reasoning (collapsed in a details tag via markdown)
+                            st.markdown("**🧠 AI Reasoning:**")
+                            st.markdown(f"> {reasoning[:300]}{'...' if len(reasoning) > 300 else ''}")
+                            
+                            # Show diff
+                            st.markdown("**📋 Patch (Unified Diff):**")
+                            if unified_diff.strip():
+                                st.code(unified_diff, language="diff")
                             else:
-                                session.failure_reason = f"Maximum iterations ({max_iterations}) reached without successful repair. Last error: {trace.error_type}"
-                                session.final_code = current_code
-                                st.session_state.repair_session = session
+                                st.caption("No changes detected")
+                            
+                            # Show line edit count
+                            st.caption(f"📝 {len(line_edits)} line edit(s) applied")
+                            
+                            # Apply patch automatically
+                            st.markdown("**Step 3:** Applying patch...")
+                            current_code = clean_code_string(fixed_code)
+                            st.success("✅ Patch applied - continuing to next iteration...")
+                            
+                            # Update session state
+                            session.final_code = current_code
+                            st.session_state.repair_session = session
+                            
+                            # Continue to next iteration (loop will continue)
                 
                 # Final Summary
                 st.markdown("---")
@@ -1392,7 +1479,7 @@ for i in range(1, 8):
                 - Review the error patterns and consider manual fixes
                 - Check if the code uses unavailable external libraries
                 - Ensure the algorithm doesn't have infinite loops
-                - Consider increasing max iterations if close to solution
+                - The system will continue trying until the code is fixed
                 """)
 
 if __name__ == "__main__":
