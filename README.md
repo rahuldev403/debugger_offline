@@ -13,13 +13,13 @@ A hackathon project that runs Python code in a secure Docker sandbox and uses AI
   - 128MB memory limit
   - Network disabled
   - 5-second timeout protection
-  
 - **🤖 AI-Powered Auto-Repair**: Uses local Ollama (Llama3) to:
+
   - Analyze error messages
   - Generate structured fixes with explanations
   - Provide unified diffs of changes
 
-- **📊 Professional Dashboard**: 
+- **📊 Professional Dashboard**:
   - Real-time system status monitoring
   - Visual error traces and debugging workflow
   - Step-by-step repair process visualization
@@ -35,22 +35,26 @@ A hackathon project that runs Python code in a secure Docker sandbox and uses AI
 ### Installation
 
 1. **Clone the repository**
+
 ```bash
 git clone <your-repo-url>
 cd PythonProject
 ```
 
 2. **Install Python dependencies**
+
 ```bash
 pip install -r requirements.txt
 ```
 
 3. **Build the Docker sandbox image**
+
 ```bash
 docker build -t my-safe-sandbox .
 ```
 
 4. **Install and start Ollama**
+
 ```bash
 # Install Ollama (visit https://ollama.ai)
 ollama pull llama3
@@ -81,6 +85,7 @@ python test_examples.py
 ```
 
 This provides 10 different test cases including:
+
 - Division by zero
 - Type errors
 - Import errors
@@ -97,6 +102,7 @@ python debug_setup.py
 ```
 
 This checks:
+
 - ✅ Python packages installed
 - ✅ Docker running & sandbox image exists
 - ✅ Ollama running & llama3 model available
@@ -146,16 +152,19 @@ This project is designed to maximize points across:
 ## 🐛 Troubleshooting
 
 ### Docker Issues
+
 - Ensure Docker Desktop is running
 - Verify the sandbox image exists: `docker images | grep my-safe-sandbox`
 - Rebuild if needed: `docker build -t my-safe-sandbox .`
 
 ### Ollama Issues
+
 - Check if Ollama is running: `curl http://localhost:11434/api/tags`
 - Restart Ollama: `ollama serve`
 - Pull model again: `ollama pull llama3`
 
 ### Streamlit Issues
+
 - Clear cache: `streamlit cache clear`
 - Check port availability: `netstat -an | grep 8501`
 

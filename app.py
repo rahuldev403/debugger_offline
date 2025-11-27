@@ -80,22 +80,106 @@ def run_in_docker(code):
         return False, f"Unexpected error: {str(e)}"
 
 
+def apply_basic_fix(bad_code, error_log):
+    """
+    Apply basic rule-based fixes when AI is unavailable or times out.
+    Returns: (explanation: str, fixed_code: str)
+    """
+    fixed_code = bad_code
+    explanation = "Applied basic fix"
+    
+    # Fix 1: Division by zero
+    if "ZeroDivisionError" in error_log or "division by zero" in error_log.lower():
+        explanation = "Added zero division check before division operation"
+        # Add try-except around potential division
+        lines = bad_code.split('\n')
+        fixed_lines = []
+        for line in lines:
+            if '/' in line and '=' in line and not line.strip().startswith('#'):
+                indent = len(line) - len(line.lstrip())
+                fixed_lines.append(' ' * indent + 'try:')
+                fixed_lines.append(' ' * (indent + 4) + line.strip())
+                fixed_lines.append(' ' * indent + 'except ZeroDivisionError:')
+                fixed_lines.append(' ' * (indent + 4) + 'print("Error: Division by zero")')
+            else:
+                fixed_lines.append(line)
+        fixed_code = '\n'.join(fixed_lines)
+    
+    # Fix 2: Type error (string + number)
+    elif "TypeError" in error_log and ("can't concat" in error_log or "unsupported operand" in error_log):
+        explanation = "Converted types to string for concatenation"
+        fixed_code = bad_code.replace(' + ', ' + str(')
+        if fixed_code != bad_code:
+            fixed_code = fixed_code.replace('\n', ') + str(\n', 1)
+    
+    # Fix 3: Index error
+    elif "IndexError" in error_log:
+        explanation = "Added index bounds checking"
+        lines = bad_code.split('\n')
+        fixed_lines = []
+        for line in lines:
+            if '[' in line and ']' in line and not line.strip().startswith('#'):
+                indent = len(line) - len(line.lstrip())
+                fixed_lines.append(' ' * indent + 'try:')
+                fixed_lines.append(' ' * (indent + 4) + line.strip())
+                fixed_lines.append(' ' * indent + 'except IndexError:')
+                fixed_lines.append(' ' * (indent + 4) + 'print("Error: Index out of range")')
+            else:
+                fixed_lines.append(line)
+        fixed_code = '\n'.join(fixed_lines)
+    
+    # Fix 4: Name error (undefined variable)
+    elif "NameError" in error_log:
+        explanation = "Attempted to define missing variable"
+        import re
+        match = re.search(r"name '(\w+)' is not defined", error_log)
+        if match:
+            var_name = match.group(1)
+            fixed_code = f"{var_name} = None  # Auto-fixed: undefined variable\n{bad_code}"
+    
+    # Fix 5: Syntax error (missing colon)
+    elif "SyntaxError" in error_log and "expected ':'" in error_log:
+        explanation = "Added missing colon"
+        lines = bad_code.split('\n')
+        fixed_lines = []
+        for line in lines:
+            if any(keyword in line for keyword in ['if ', 'for ', 'while ', 'def ', 'class ']):
+                if not line.rstrip().endswith(':'):
+                    fixed_lines.append(line.rstrip() + ':')
+                else:
+                    fixed_lines.append(line)
+            else:
+                fixed_lines.append(line)
+        fixed_code = '\n'.join(fixed_lines)
+    
+    return explanation, fixed_code
+
+
 def get_ai_fix(bad_code, error_log):
     """
     Use Ollama LLM to fix broken code with STRUCTURED JSON OUTPUT.
-    Returns: (explanation: str, fixed_code: str)
+    Falls back to basic rule-based fixes if AI fails or times out.
+    Returns: (explanation: str, fixed_code: str, time_taken: float)
     """
+    import time
+    start_time = time.time()
+    
     try:
         # CRITICAL: JSON Mode prompt for structured patching points
-        system_prompt = """You are an expert Python debugging assistant. Analyze the code and error, then respond with ONLY a valid JSON object.
+        system_prompt = """You are an expert Python debugging assistant running in a RESTRICTED DOCKER ENVIRONMENT.
 
-Your response MUST be valid JSON with this exact structure:
+CRITICAL RULES:
+1. The environment has NO INTERNET access.
+2. You CANNOT install new packages (pip is disabled).
+3. You CANNOT use external libraries like 'numpy', 'pandas', 'scipy', etc.
+4. You MUST fix code by rewriting it to use ONLY the Python Standard Library (math, random, json, etc.).
+
+Analyze the code and error, then respond with ONLY a valid JSON object:
 {
-  "explanation": "Single sentence explaining why the bug occurred",
-  "fixed_code": "Complete corrected Python code"
-}
-
-Do not include markdown, code blocks, or any text outside the JSON object."""
+  "explanation": "Single sentence explaining the bug and the fix",
+  "fixed_code": "Complete corrected Python code using ONLY standard libraries",
+  "reasoning": "Step-by-step analysis"
+}"""
 
         user_prompt = f"""CODE:
 {bad_code}
@@ -118,6 +202,8 @@ Return ONLY the JSON object with explanation and fixed_code."""
             timeout=30
         )
         
+        time_taken = time.time() - start_time
+        
         if response.status_code == 200:
             result = response.json()
             ai_response = result.get("response", "")
@@ -137,7 +223,7 @@ Return ONLY the JSON object with explanation and fixed_code."""
                 if fixed_code.endswith("```"):
                     fixed_code = fixed_code[:-3]
                 
-                return explanation.strip(), fixed_code.strip()
+                return explanation.strip(), fixed_code.strip(), time_taken
                 
             except json.JSONDecodeError:
                 # Fallback if JSON parsing fails
@@ -149,19 +235,28 @@ Return ONLY the JSON object with explanation and fixed_code."""
                     end = cleaned.find("```", start)
                     if end > start:
                         cleaned = cleaned[start:end]
-                return "AI attempted to fix the code", cleaned.strip()
+                return "AI attempted to fix the code", cleaned.strip(), time_taken
         else:
-            return "AI request failed", bad_code
+            time_taken = time.time() - start_time
+            st.warning("⚠️ AI returned error. Applying basic rule-based fix...")
+            explanation, fixed_code = apply_basic_fix(bad_code, error_log)
+            return explanation, fixed_code, time_taken
             
     except requests.exceptions.ConnectionError:
-        st.error("❌ Ollama Error: Cannot connect to Ollama at http://localhost:11434. Make sure Ollama is running.")
-        return "Ollama connection failed", bad_code
+        time_taken = time.time() - start_time
+        st.error("❌ Ollama Error: Cannot connect to Ollama. Applying basic rule-based fix...")
+        explanation, fixed_code = apply_basic_fix(bad_code, error_log)
+        return explanation, fixed_code, time_taken
     except requests.exceptions.Timeout:
-        st.error("❌ Ollama Error: Request timed out.")
-        return "Request timeout", bad_code
+        time_taken = 30.0  # Timeout occurred
+        st.warning("⚠️ Ollama timeout (>30s). Applying basic rule-based fix...")
+        explanation, fixed_code = apply_basic_fix(bad_code, error_log)
+        return explanation, fixed_code, time_taken
     except Exception as e:
-        st.error(f"❌ AI Fix Error: {str(e)}")
-        return f"Error: {str(e)}", bad_code
+        time_taken = time.time() - start_time
+        st.error(f"❌ AI Fix Error: {str(e)}. Applying basic rule-based fix...")
+        explanation, fixed_code = apply_basic_fix(bad_code, error_log)
+        return explanation, fixed_code, time_taken
 
 
 def generate_diff(original_code, fixed_code):
@@ -229,7 +324,7 @@ def main():
         st.markdown("---")
         st.subheader("⚙️ Security Features")
         st.markdown("""
-        - ✅ Memory Limit: 128MB
+        - ✅ Memory Limit: 128MB 7
         - ✅ Network Disabled
         - ✅ 5s Timeout
         - ✅ Isolated Container
@@ -312,11 +407,11 @@ print(f"Result: {result}")"""
                     st.subheader("🤖 AI Patching Process")
                     
                     with st.spinner("🧠 AI is analyzing the error and generating a fix..."):
-                        explanation, fixed_code = get_ai_fix(current_code, output)
+                        explanation, fixed_code, time_taken = get_ai_fix(current_code, output)
                     
-                    # Show patch instructions (Reasoning)
+                    # Show patch instructions (Reasoning) with timing
                     st.markdown("#### 💡 Patch Instructions")
-                    st.info(f"**Diagnosis**: {explanation}")
+                    st.info(f"**Diagnosis**: {explanation}\n\n⏱️ **AI Response Time**: {time_taken:.2f} seconds")
                     
                     # Show unified diff
                     st.markdown("#### 📊 Unified Diff")
