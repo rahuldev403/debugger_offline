@@ -153,9 +153,6 @@ PythonProject/
 │   ├── Docker Integration # Sandbox execution with security limits
 │   ├── AI Integration     # Ollama/Llama3 fix generation
 │   └── Utilities          # Diff generation, error parsing, code cleaning
-├── debug_setup.py         # System diagnostics tool
-├── test_examples.py       # Test cases for the dashboard
-├── user_script.py         # Temporary script created during execution
 ├── Dockerfile            # Docker sandbox configuration
 ├── requirements.txt      # Python dependencies
 └── README.md            # This file
@@ -205,30 +202,21 @@ Adjustable via sidebar slider (default: 5, range: 1-10)
 
 ## 🧪 Testing
 
-### Test Examples Script
+The application includes built-in test examples accessible from the sidebar:
 
-Run comprehensive test scenarios:
+- **Import Error (numpy)**: Tests handling of unavailable external libraries
+- **Division by Zero**: Tests error handling for mathematical errors
+- **Undefined Variable**: Tests name resolution fixes
+- **Infinite Loop**: Tests timeout protection
+- **Working Code**: Tests successful execution flow
 
-```bash
-python test_examples.py
-```
+### System Status Checks
 
-### System Diagnostics
+The application automatically checks system status in the sidebar:
 
-Verify all components are working:
-
-```bash
-python debug_setup.py
-```
-
-Checks:
-
-- ✅ Python packages installed correctly
-- ✅ Docker daemon running
-- ✅ Sandbox image (`my-safe-sandbox`) exists
-- ✅ Ollama service accessible
-- ✅ Llama3 model available
-- ✅ Streamlit installation
+- ✅ Docker daemon running and sandbox image availability
+- ✅ Ollama service accessibility and llama3 model presence
+- Real-time connection monitoring with detailed status messages
 
 ## 🏗️ Technical Architecture
 
