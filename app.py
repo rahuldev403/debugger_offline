@@ -87,14 +87,25 @@ st.markdown("""
         font-family: 'Outfit', sans-serif;
     }
     
-    /* Hide Streamlit Branding */
-    #MainMenu, footer, header {visibility: hidden;}
+    /* Main content container - let Streamlit handle responsive layout */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
+    
+    /* Hide Streamlit Branding - but keep sidebar toggle button */
+    #MainMenu, footer {visibility: hidden;}
     .stDeployButton {display: none;}
+    
+    /* Hide header text but keep the toggle button */
+    header .decoration {
+        display: none !important;
+    }
     
     /* Sidebar Styling */
     [data-testid="stSidebar"] {
-        background: var(--bg-secondary);
-        border-right: 1px solid var(--border-color);
+        background: var(--bg-secondary) !important;
+        border-right: 1px solid var(--border-color) !important;
     }
     
     [data-testid="stSidebar"] .stMarkdown h1,
@@ -102,6 +113,28 @@ st.markdown("""
     [data-testid="stSidebar"] .stMarkdown h3 {
         color: var(--text-primary);
         font-family: 'Outfit', sans-serif;
+    }
+    
+    /* Ensure sidebar toggle button is visible and styled */
+    button[data-testid="baseButton-header"] {
+        visibility: visible !important;
+        display: block !important;
+        position: relative !important;
+        z-index: 999 !important;
+    }
+    
+    /* Header container - keep visible for toggle button */
+    header {
+        visibility: visible !important;
+    }
+    
+    /* Make sure the toggle button container is visible */
+    [data-testid="stHeader"] {
+        visibility: visible !important;
+    }
+    
+    [data-testid="stHeader"] > div {
+        visibility: visible !important;
     }
     
     /* Custom Header */
