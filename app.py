@@ -637,31 +637,81 @@ def validate_logical_correctness(code: str, output: str) -> tuple[bool, Optional
             has_tree_nodes = re.search(r'Node\([^)]+\)', code) or 'root' in code.lower()
             
             if has_tree_nodes:
-                # Extract height value from output
+                # First, check the code directly for missing +1
+                func_code = extract_function_code(code, func_name)
+                if func_code:
+                    # Check if function uses max() but is missing +1
+                    if 'max(' in func_code or 'max (' in func_code:
+                        # Look for return statement with max
+                        return_patterns = [
+                            r'return\s+max\s*\([^)]+\)\s*$',  # return max(...) without +1
+                            r'return\s+max\s*\([^)]+\)\s*;?\s*$',  # with semicolon
+                        ]
+                        for pattern in return_patterns:
+                            if re.search(pattern, func_code, re.MULTILINE):
+                                # Check if there's a +1 anywhere after max
+                                max_pos = func_code.find('max(')
+                                if max_pos != -1:
+                                    after_max = func_code[max_pos:]
+                                    # Check if +1 or + 1 appears after max( in the return statement
+                                    if '+ 1' not in after_max and '+1' not in after_max and '1 +' not in after_max:
+                                        return False, f"LOGICAL ERROR: Function '{func_name}' calculates tree height incorrectly. The return statement uses max() but is missing '+ 1' to account for the current node. It should return max(left_height, right_height) + 1, not just max(left_height, right_height)."
+                
+                # Also check output for height 0 on non-empty tree - comprehensive pattern matching
                 height_patterns = [
                     r'[Hh]eight\s*(?:of\s*(?:tree|tree:)?)?\s*:?\s*(\d+)',
                     r'[Hh]eight\s*=\s*(\d+)',
                     r'height\s*=\s*(\d+)',
                     r'print.*[Hh]eight.*?(\d+)',
+                    r'[Hh]eight.*?(\d+)',  # More general pattern
+                    r'(\d+)',  # Last resort - any number in output (if context suggests height)
                 ]
+                
+                node_count = len(re.findall(r'Node\(', code))
+                height_value = None
                 
                 for pattern in height_patterns:
                     match = re.search(pattern, output)
                     if match:
-                        height_value = int(match.group(1))
-                        node_count = len(re.findall(r'Node\(', code))
-                        
-                        # Non-empty tree cannot have height 0
-                        if node_count > 0 and height_value == 0:
-                            # Check if code is missing +1
-                            func_code = extract_function_code(code, func_name)
-                            if func_code and 'max(' in func_code:
-                                if '+ 1' not in func_code and '+1' not in func_code:
-                                    return False, f"LOGICAL ERROR: Function '{func_name}' calculates tree height incorrectly. A non-empty tree (with {node_count} node(s)) returned height 0, which is impossible. The function is missing '+ 1' in the return statement. It should return max(left_height, right_height) + 1 to account for the current node."
-                                elif 'missing' in func_code.lower() or '# + 1 is missing' in func_code:
-                                    return False, f"LOGICAL ERROR: Function '{func_name}' is missing '+ 1' in the height calculation. The correct formula is max(left_height, right_height) + 1."
-                            else:
-                                return False, f"LOGICAL ERROR: Function '{func_name}' returned height 0 for a non-empty tree with {node_count} node(s). The height calculation is incorrect."
+                        try:
+                            height_value = int(match.group(1))
+                            # Only use this value if it's reasonable (0-1000) and we have tree nodes
+                            if 0 <= height_value <= 1000 and has_tree_nodes:
+                                break
+                        except (ValueError, IndexError):
+                            continue
+                
+                # Non-empty tree cannot have height 0
+                if height_value is not None and node_count > 0 and height_value == 0:
+                    # Check if code is missing +1
+                    if not func_code:
+                        func_code = extract_function_code(code, func_name)
+                    
+                    if func_code:
+                        # Check for max() pattern
+                        if 'max(' in func_code or 'max (' in func_code:
+                            # Check if +1 is missing in the function
+                            func_code_normalized = ' '.join(func_code.split())  # Normalize whitespace
+                            has_plus_one = (
+                                '+ 1' in func_code_normalized or 
+                                '+1' in func_code_normalized or 
+                                '1 +' in func_code_normalized
+                            )
+                            if not has_plus_one:
+                                return False, f"LOGICAL ERROR: Function '{func_name}' calculates tree height incorrectly. A non-empty tree (with {node_count} node(s)) returned height 0, which is impossible. The function is missing '+ 1' in the return statement. It should return max(left_height, right_height) + 1 to account for the current node."
+                        # Check for if-else pattern without +1
+                        elif re.search(r'if\s+.*return\s+\w+', func_code, re.IGNORECASE):
+                            # Check if any return has +1
+                            returns = re.findall(r'return\s+[^;\n]+', func_code, re.IGNORECASE)
+                            has_any_plus_one = any(
+                                '+ 1' in ret or '+1' in ret or '1 +' in ret 
+                                for ret in returns
+                            )
+                            if not has_any_plus_one:
+                                return False, f"LOGICAL ERROR: Function '{func_name}' returned height 0 for a non-empty tree with {node_count} node(s). The height calculation is missing '+ 1' to account for the current node."
+                        else:
+                            # Generic error if we can't determine the pattern
+                            return False, f"LOGICAL ERROR: Function '{func_name}' returned height 0 for a non-empty tree with {node_count} node(s). The height calculation is incorrect - it should account for the current node with '+ 1'."
         
         # === TREE TRAVERSAL VALIDATION ===
         if 'preorder' in func_name_lower:
@@ -1140,6 +1190,302 @@ def clean_code_string(code: str) -> str:
     
     return '\n'.join(lines)
 
+def validate_function_implementation(code: str) -> tuple[bool, Optional[str], Optional[str]]:
+    """
+    Pre-execution validation: Use Ollama to check if function implementations match their names/intents.
+    Returns (is_valid, error_message, validation_details) where is_valid=False indicates implementation mismatch.
+    """
+    # Handle edge cases
+    if not code or not code.strip():
+        return True, None, "Empty code - skipping validation"
+    
+    functions = extract_function_names(code)
+    
+    if not functions:
+        return True, None, "No functions found in code"
+    
+    # Check if any function names suggest data structure operations
+    data_structure_functions = []
+    for func_name, func_sig in functions:
+        func_name_lower = func_name.lower()
+        
+        # Tree operations - height and depth are critical
+        if 'height' in func_name_lower or 'depth' in func_name_lower:
+            if 'tree' in code.lower() or 'node' in code.lower() or 'root' in code.lower() or 'left' in code.lower() or 'right' in code.lower():
+                data_structure_functions.append((func_name, 'tree_operation'))
+        elif any(keyword in func_name_lower for keyword in ['size', 'count', 'sum']):
+            if 'tree' in code.lower() or 'node' in code.lower() or 'root' in code.lower():
+                data_structure_functions.append((func_name, 'tree_operation'))
+        
+        # Tree traversals
+        if any(keyword in func_name_lower for keyword in ['preorder', 'inorder', 'postorder', 'levelorder', 'bfs', 'dfs']):
+            data_structure_functions.append((func_name, 'tree_traversal'))
+        
+        # Stack operations
+        if any(keyword in func_name_lower for keyword in ['stack_push', 'stack_pop', 'stack_peek', 'push', 'pop']):
+            if 'stack' in code.lower():
+                data_structure_functions.append((func_name, 'stack_operation'))
+        
+        # Queue operations
+        if any(keyword in func_name_lower for keyword in ['enqueue', 'dequeue', 'queue_add', 'queue_remove']):
+            if 'queue' in code.lower():
+                data_structure_functions.append((func_name, 'queue_operation'))
+        
+        # Heap operations
+        if any(keyword in func_name_lower for keyword in ['heap_insert', 'heap_extract', 'heapify']):
+            if 'heap' in code.lower():
+                data_structure_functions.append((func_name, 'heap_operation'))
+        
+        # Search algorithms
+        if any(keyword in func_name_lower for keyword in ['binary_search', 'linear_search', 'search']):
+            data_structure_functions.append((func_name, 'search_algorithm'))
+        
+        # Sorting algorithms
+        if any(keyword in func_name_lower for keyword in ['bubble_sort', 'quick_sort', 'merge_sort', 'heap_sort', 'insertion_sort', 'selection_sort']):
+            data_structure_functions.append((func_name, 'sort_algorithm'))
+        
+        # Graph algorithms
+        if any(keyword in func_name_lower for keyword in ['dijkstra', 'topological_sort', 'kruskal', 'prim', 'bfs', 'dfs']):
+            if 'graph' in code.lower() or 'node' in code.lower():
+                data_structure_functions.append((func_name, 'graph_algorithm'))
+    
+    if not data_structure_functions:
+        return True, None, "No data structure functions detected - skipping pre-execution validation"
+    
+    # Quick code-based validation for height functions (before Ollama) - comprehensive check
+    for func_name, func_type in data_structure_functions:
+        if func_type == 'tree_operation' and 'height' in func_name.lower():
+            func_code = extract_function_code(code, func_name)
+            if func_code:
+                # Normalize function code for analysis (remove comments, normalize whitespace)
+                normalized_code = re.sub(r'#.*', '', func_code)  # Remove comments
+                normalized_code = ' '.join(normalized_code.split())  # Normalize whitespace
+                
+                # Check if function is recursive (calls itself)
+                is_recursive = func_name in func_code
+                
+                if is_recursive:
+                    # Check for max() pattern - could be on same line or different lines
+                    has_max = 'max(' in func_code or 'max (' in func_code
+                    
+                    if has_max:
+                        # Look for return statement with max
+                        # Pattern 1: return max(...) on same line
+                        return_max_pattern = r'return\s+max\s*\([^)]+\)'
+                        if re.search(return_max_pattern, func_code, re.IGNORECASE):
+                            # Check if +1 appears anywhere after max( in the return context
+                            # Get the return statement and a few lines after it
+                            lines = func_code.split('\n')
+                            for i, line in enumerate(lines):
+                                if 'return' in line.lower() and 'max(' in line.lower():
+                                    # Check current line and next few lines for +1
+                                    check_text = ' '.join(lines[i:min(i+3, len(lines))])
+                                    # Check for various +1 patterns
+                                    has_plus_one = (
+                                        '+ 1' in check_text or 
+                                        '+1' in check_text or 
+                                        '1 +' in check_text or
+                                        '+1)' in check_text or
+                                        '+ 1)' in check_text
+                                    )
+                                    if not has_plus_one:
+                                        return False, f"Function '{func_name}' is missing '+ 1' in the return statement. Tree height must return max(left_height, right_height) + 1 to account for the current node.", f"Quick validation detected missing '+ 1' in height function"
+                                    break
+                        else:
+                            # Pattern 2: max() on separate line, then return
+                            # Check if max is used but return doesn't have +1
+                            lines = func_code.split('\n')
+                            max_line_idx = None
+                            return_line_idx = None
+                            
+                            for i, line in enumerate(lines):
+                                if 'max(' in line.lower() or 'max (' in line.lower():
+                                    max_line_idx = i
+                                if 'return' in line.lower() and max_line_idx is not None:
+                                    return_line_idx = i
+                                    break
+                            
+                            if max_line_idx is not None and return_line_idx is not None:
+                                # Check if return statement has +1
+                                return_line = lines[return_line_idx]
+                                context_lines = ' '.join(lines[max(0, return_line_idx-2):return_line_idx+2])
+                                has_plus_one = (
+                                    '+ 1' in context_lines or 
+                                    '+1' in context_lines or 
+                                    '1 +' in context_lines
+                                )
+                                if not has_plus_one:
+                                    return False, f"Function '{func_name}' is missing '+ 1' in the return statement. Tree height must return max(left_height, right_height) + 1 to account for the current node.", f"Quick validation detected missing '+ 1' in height function"
+                    
+                    # Also check for if-else pattern without +1
+                    # Pattern: if left_height > right_height: return left_height (missing +1)
+                    if_else_pattern = r'if\s+\w+\s*[><=]+\s*\w+.*return\s+\w+'
+                    if re.search(if_else_pattern, func_code, re.IGNORECASE):
+                        # Check if any return in if-else has +1
+                        if_else_returns = re.findall(r'return\s+[^;\n]+', func_code, re.IGNORECASE)
+                        has_any_plus_one = any(
+                            '+ 1' in ret or '+1' in ret or '1 +' in ret 
+                            for ret in if_else_returns
+                        )
+                        if not has_any_plus_one and len(if_else_returns) > 0:
+                            return False, f"Function '{func_name}' is missing '+ 1' in the return statement(s). Tree height must return max(left_height, right_height) + 1 to account for the current node.", f"Quick validation detected missing '+ 1' in height function"
+    
+    # Use Ollama to validate each function
+    try:
+        validation_prompt = """You are a Senior Software Engineer specializing in Data Structures and Algorithms.
+
+YOUR TASK:
+Analyze the provided function implementation and determine if it correctly implements the algorithm suggested by its function name.
+
+CRITICAL VALIDATION RULES:
+
+**Tree Height/Depth Functions:**
+- Function named "height" or "depth" MUST return max(left_height, right_height) + 1
+- The "+ 1" is CRITICAL - it accounts for the current node
+- If the return statement is just "max(left_height, right_height)" without "+ 1", it's WRONG
+- A single node tree should have height 1, not 0
+
+**Tree Traversal Functions:**
+- "preorder" → Must visit Root FIRST, then Left, then Right (Root->Left->Right)
+- "inorder" → Must visit Left FIRST, then Root, then Right (Left->Root->Right)
+- "postorder" → Must visit Left FIRST, then Right, then Root (Left->Right->Root)
+- "level_order" or "bfs" → Must visit level by level, left to right
+
+**Stack Operations:**
+- "push" or "stack_push" → Must add to top (LIFO - Last In First Out)
+- "pop" or "stack_pop" → Must remove from top (LIFO)
+- "peek" or "stack_peek" → Must view top without removing
+
+**Queue Operations:**
+- "enqueue" or "queue_add" → Must add to rear (FIFO - First In First Out)
+- "dequeue" or "queue_remove" → Must remove from front (FIFO)
+
+**Heap Operations:**
+- "heap_insert" → Must maintain heap property (parent >= children for max-heap, parent <= children for min-heap)
+- "heap_extract_min" → Must remove and return minimum, then restore heap property
+- "heap_extract_max" → Must remove and return maximum, then restore heap property
+
+**Search Algorithms:**
+- "binary_search" → Must use divide-and-conquer on sorted array, O(log n)
+- "linear_search" → Must check each element sequentially, O(n)
+
+**Sorting Algorithms:**
+- "bubble_sort" → Must compare adjacent elements and swap if needed
+- "quick_sort" → Must partition and recursively sort
+- "merge_sort" → Must divide, sort, merge
+- "heap_sort" → Must build heap and extract elements
+
+**Graph Algorithms:**
+- "dijkstra" → Must find shortest path from source
+- "topological_sort" → Must order nodes respecting dependencies
+- "bfs" → Must use queue for level-order traversal
+- "dfs" → Must use stack/recursion for depth-first traversal
+
+RESPOND WITH JSON ONLY:
+{
+    "is_correct": true/false,
+    "error_message": "If is_correct is false, explain what's wrong (e.g., 'height function missing + 1 in return statement')",
+    "details": "Additional validation details"
+}"""
+
+        # Extract function code for each data structure function
+        validation_errors = []
+        ollama_available = True
+        validated_count = 0
+        
+        for func_name, func_type in data_structure_functions:
+            func_code = extract_function_code(code, func_name)
+            if not func_code:
+                continue
+            
+            user_validation_prompt = f"""FUNCTION TO VALIDATE:
+Function Name: {func_name}
+Function Type: {func_type}
+
+FUNCTION CODE:
+```python
+{func_code}
+```
+
+FULL CODE CONTEXT:
+```python
+{code}
+```
+
+Analyze if the implementation of '{func_name}' correctly matches what the function name implies. Check for:
+1. Correct algorithm implementation
+2. Missing critical operations (e.g., missing '+ 1' in height functions)
+3. Wrong order of operations (e.g., wrong traversal order)
+4. Incorrect data structure operations (e.g., wrong LIFO/FIFO behavior)
+
+Respond with JSON only."""
+
+            if ollama_available:
+                try:
+                    response = requests.post(
+                        "http://localhost:11434/api/generate",
+                        json={
+                            "model": "llama3",
+                            "prompt": f"{validation_prompt}\n\n{user_validation_prompt}",
+                            "stream": False,
+                            "format": "json"
+                        },
+                        timeout=20  # Reduced timeout for faster response
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        try:
+                            # Try to parse JSON response
+                            response_text = result.get("response", "{}")
+                            # Handle case where response might be wrapped
+                            if isinstance(response_text, str):
+                                parsed = json.loads(response_text)
+                            else:
+                                parsed = response_text
+                            
+                            is_correct = parsed.get("is_correct", True)
+                            
+                            if not is_correct:
+                                error_msg = parsed.get("error_message", f"Function '{func_name}' implementation does not match its name")
+                                validation_errors.append(f"Function '{func_name}': {error_msg}")
+                            else:
+                                validated_count += 1
+                        except (json.JSONDecodeError, KeyError, TypeError) as e:
+                            # If Ollama fails to parse, continue with next function
+                            # Don't fail entire validation due to one function's parsing error
+                            continue
+                    else:
+                        # Non-200 status - mark Ollama as potentially unavailable but continue
+                        if response.status_code >= 500:
+                            ollama_available = False
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                    # Ollama unavailable - mark flag and continue with code-based validation only
+                    ollama_available = False
+                except Exception as e:
+                    # Other errors - continue with next function
+                    continue
+        
+        # If Ollama was unavailable for all functions, rely on code-based validation only
+        if not ollama_available and validated_count == 0:
+            # Code-based validation already ran, so if we got here without errors, it's likely OK
+            # But we should note that Ollama validation was skipped
+            return True, None, "Ollama unavailable - used code-based validation only"
+        
+        if validation_errors:
+            error_message = "PRE-EXECUTION VALIDATION FAILED:\n" + "\n".join(validation_errors)
+            return False, error_message, f"Implementation validation failed for {len(validation_errors)} function(s)"
+        
+        if validated_count > 0:
+            return True, None, f"Validated {validated_count} function(s) via Ollama - all correct"
+        else:
+            return True, None, "Code-based validation passed - Ollama validation skipped"
+        
+    except Exception as e:
+        # If validation fails entirely, allow execution to proceed (fail open)
+        # This ensures the system doesn't block valid code due to validation errors
+        return True, None, f"Validation error: {str(e)} - proceeding with execution"
+
 def get_ai_fix(bad_code: str, error_log: str) -> tuple[str, str, str, float]:
     """Use Ollama LLM to fix broken code with balanced reasoning."""
     start_time = time.time()
@@ -1579,16 +1925,105 @@ for i in range(1, 8):
                 
                 current_code = code_input
                 iteration = 0
+                max_iterations = 50  # Safety limit to prevent infinite loops
+                previous_codes = set()  # Track previous code to detect cycles
                 
-                # Unlimited repair loop - continues until code is fixed
-                while True:
+                # Unlimited repair loop - continues until code is fixed (with safety limit)
+                while iteration < max_iterations:
                     iteration += 1
                     session.total_iterations = iteration
+                    
+                    # Safety check: detect if we're stuck in a loop (same code repeating)
+                    code_hash = hash(current_code.strip())
+                    if code_hash in previous_codes:
+                        session.success = False
+                        session.failure_reason = f"Repair loop detected: Code unchanged after {iteration} iterations. The system may be unable to fix this code automatically."
+                        st.session_state.repair_session = session
+                        st.error("⚠️ **Repair Loop Detected**\n\nThe code appears to be cycling without improvement. Manual review recommended.")
+                        break
+                    previous_codes.add(code_hash)
                     
                     # Create iteration card
                     with st.status(f"🔄 Iteration {iteration} (Unlimited)", expanded=True) as status:
                         
+                        # Step 0: Pre-execution validation (check implementation correctness)
+                        st.markdown("**Step 0:** Pre-execution validation (checking implementation correctness)...")
+                        with st.spinner("🔍 Validating function implementations via Ollama..."):
+                            validation_passed, validation_error, validation_details = validate_function_implementation(current_code)
+                        
+                        if not validation_passed:
+                            # Pre-execution validation failed - treat as error and fix
+                            status.update(label=f"❌ Iteration {iteration}: Implementation validation failed", state="error")
+                            
+                            st.warning("**⚠️ Pre-Execution Validation Failed!**")
+                            st.markdown("**🔍 Validation Error:**")
+                            st.code(validation_error or "Function implementation does not match its name/intent", language="text")
+                            
+                            if validation_details:
+                                st.caption(f"ℹ️ {validation_details}")
+                            
+                            # Treat validation failure as an error to fix
+                            error_output = f"PRE-EXECUTION VALIDATION ERROR:\n{validation_error}\n\nThe function implementation does not correctly match what the function name implies. Please fix the implementation to match the expected algorithm."
+                            
+                            # Step 2: AI Analysis - Fix the implementation
+                            st.markdown("---")
+                            st.markdown("**Step 2:** AI analyzing and fixing implementation...")
+                            
+                            with st.spinner("🧠 Consulting AI..."):
+                                explanation, fixed_code, reasoning, ai_time = get_ai_fix(current_code, error_output)
+                            
+                            # Create patch record
+                            unified_diff = generate_unified_diff(current_code, fixed_code)
+                            line_edits = generate_line_edits(current_code, fixed_code)
+                            
+                            patch = PatchRecord(
+                                iteration=iteration,
+                                original_code=current_code,
+                                fixed_code=fixed_code,
+                                unified_diff=unified_diff,
+                                line_edits=line_edits,
+                                explanation=explanation,
+                                reasoning=reasoning,
+                                ai_time=ai_time
+                            )
+                            session.patch_logs.append(patch)
+                            
+                            # Show AI explanation
+                            st.info(f"💡 **Fix:** {explanation}")
+                            st.caption(f"⏱️ AI response time: {ai_time:.2f}s")
+                            
+                            # Show reasoning
+                            st.markdown("**🧠 AI Reasoning:**")
+                            st.markdown(f"> {reasoning[:300]}{'...' if len(reasoning) > 300 else ''}")
+                            
+                            # Show diff
+                            st.markdown("**📋 Patch (Unified Diff):**")
+                            if unified_diff.strip():
+                                st.code(unified_diff, language="diff")
+                            else:
+                                st.caption("No changes detected")
+                            
+                            # Show line edit count
+                            st.caption(f"📝 {len(line_edits)} line edit(s) applied")
+                            
+                            # Apply patch automatically
+                            st.markdown("**Step 3:** Applying patch...")
+                            current_code = clean_code_string(fixed_code)
+                            st.success("✅ Patch applied - continuing to next iteration...")
+                            
+                            # Update session state
+                            session.final_code = current_code
+                            st.session_state.repair_session = session
+                            
+                            # Continue to next iteration (loop will continue)
+                            continue
+                        
+                        # Pre-execution validation passed - proceed with execution
+                        if validation_details:
+                            st.success(f"✅ Pre-execution validation passed: {validation_details}")
+                        
                         # Step 1: Execute
+                        st.markdown("---")
                         st.markdown("**Step 1:** Executing in sandbox...")
                         trace = run_in_docker(current_code)
                         trace.iteration = iteration
@@ -1675,6 +2110,13 @@ for i in range(1, 8):
                             st.session_state.repair_session = session
                             
                             # Continue to next iteration (loop will continue)
+                
+                # Check if we hit max iterations without success
+                if iteration >= max_iterations and not session.success:
+                    session.success = False
+                    session.failure_reason = f"Maximum iterations ({max_iterations}) reached without successful repair. The code may require manual intervention."
+                    st.session_state.repair_session = session
+                    st.warning(f"⚠️ **Maximum Iterations Reached**\n\nThe system attempted {max_iterations} repairs but could not fix the code automatically. Manual review recommended.")
                 
                 # Final Summary
                 st.markdown("---")
