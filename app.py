@@ -605,6 +605,191 @@ def extract_logs_from_output(output: str) -> List[str]:
     """Extract print statements and logs from output."""
     return [line for line in output.split('\n') if line.strip()]
 
+def extract_function_names(code: str) -> List[tuple[str, str]]:
+    """
+    Extract function definitions and their names from code.
+    Returns list of (function_name, function_signature_line) tuples.
+    """
+    functions = []
+    lines = code.split('\n')
+    for i, line in enumerate(lines):
+        # Match function definitions: def function_name(...):
+        match = re.match(r'\s*def\s+(\w+)\s*\(', line)
+        if match:
+            func_name = match.group(1)
+            functions.append((func_name, line.strip()))
+    return functions
+
+def validate_logical_correctness(code: str, output: str) -> tuple[bool, Optional[str]]:
+    """
+    Validate logical correctness of code execution output based on function names and expected behavior.
+    Returns (is_valid, error_message) where is_valid=False indicates a logical error.
+    """
+    functions = extract_function_names(code)
+    
+    # Check each function for logical correctness based on its name
+    for func_name, func_sig in functions:
+        func_name_lower = func_name.lower()
+        
+        # === TREE HEIGHT VALIDATION ===
+        if 'height' in func_name_lower:
+            # Check if tree nodes are created
+            has_tree_nodes = re.search(r'Node\([^)]+\)', code) or 'root' in code.lower()
+            
+            if has_tree_nodes:
+                # Extract height value from output
+                height_patterns = [
+                    r'[Hh]eight\s*(?:of\s*(?:tree|tree:)?)?\s*:?\s*(\d+)',
+                    r'[Hh]eight\s*=\s*(\d+)',
+                    r'height\s*=\s*(\d+)',
+                    r'print.*[Hh]eight.*?(\d+)',
+                ]
+                
+                for pattern in height_patterns:
+                    match = re.search(pattern, output)
+                    if match:
+                        height_value = int(match.group(1))
+                        node_count = len(re.findall(r'Node\(', code))
+                        
+                        # Non-empty tree cannot have height 0
+                        if node_count > 0 and height_value == 0:
+                            # Check if code is missing +1
+                            func_code = extract_function_code(code, func_name)
+                            if func_code and 'max(' in func_code:
+                                if '+ 1' not in func_code and '+1' not in func_code:
+                                    return False, f"LOGICAL ERROR: Function '{func_name}' calculates tree height incorrectly. A non-empty tree (with {node_count} node(s)) returned height 0, which is impossible. The function is missing '+ 1' in the return statement. It should return max(left_height, right_height) + 1 to account for the current node."
+                                elif 'missing' in func_code.lower() or '# + 1 is missing' in func_code:
+                                    return False, f"LOGICAL ERROR: Function '{func_name}' is missing '+ 1' in the height calculation. The correct formula is max(left_height, right_height) + 1."
+                            else:
+                                return False, f"LOGICAL ERROR: Function '{func_name}' returned height 0 for a non-empty tree with {node_count} node(s). The height calculation is incorrect."
+        
+        # === TREE TRAVERSAL VALIDATION ===
+        if 'preorder' in func_name_lower:
+            # Preorder: Root -> Left -> Right
+            # Check if output matches this order
+            func_code = extract_function_code(code, func_name)
+            if func_code:
+                # Check if root is visited first (preorder should append root before recursive calls)
+                lines = func_code.split('\n')
+                root_append_before_recursion = False
+                for i, line in enumerate(lines):
+                    if 'append' in line.lower() or 'res.append' in line.lower():
+                        # Check if next non-empty line is a recursive call
+                        for j in range(i+1, len(lines)):
+                            if lines[j].strip() and not lines[j].strip().startswith('#'):
+                                if func_name in lines[j] or 'preorder' in lines[j].lower():
+                                    root_append_before_recursion = True
+                                break
+                        break
+                
+                if not root_append_before_recursion and 'append' in func_code.lower():
+                    # Check output order - in preorder, first element should be root
+                    # Extract list/array from output
+                    list_match = re.search(r'\[([^\]]+)\]', output)
+                    if list_match:
+                        elements = [x.strip() for x in list_match.group(1).split(',')]
+                        # Check if first element matches root value
+                        root_match = re.search(r'root\s*=\s*Node\((\d+)\)', code)
+                        if root_match:
+                            root_val = root_match.group(1)
+                            if elements and elements[0] != root_val:
+                                return False, f"LOGICAL ERROR: Function '{func_name}' should perform PREORDER traversal (Root->Left->Right), but the output shows root value '{root_val}' is not first. The root should be visited before left and right subtrees."
+        
+        if 'inorder' in func_name_lower:
+            # Inorder: Left -> Root -> Right
+            # Root should be in the middle
+            func_code = extract_function_code(code, func_name)
+            if func_code and 'append' in func_code.lower():
+                # Check if root is appended between left and right recursive calls
+                lines = func_code.split('\n')
+                left_call_found = False
+                root_append_found = False
+                right_call_found = False
+                
+                for line in lines:
+                    if func_name in line or 'inorder' in line.lower():
+                        if '.left' in line or 'left' in line.lower():
+                            left_call_found = True
+                        elif '.right' in line or 'right' in line.lower():
+                            right_call_found = True
+                    if 'append' in line.lower() and left_call_found and not right_call_found:
+                        root_append_found = True
+                
+                if left_call_found and not (root_append_found and right_call_found):
+                    return False, f"LOGICAL ERROR: Function '{func_name}' should perform INORDER traversal (Left->Root->Right). The root should be visited between left and right subtree traversals."
+        
+        if 'postorder' in func_name_lower:
+            # Postorder: Left -> Right -> Root
+            # Root should be last
+            func_code = extract_function_code(code, func_name)
+            if func_code:
+                # Check if root is appended after both recursive calls
+                lines = func_code.split('\n')
+                root_append_after_calls = False
+                recursion_found = False
+                
+                for i, line in enumerate(lines):
+                    if func_name in line or 'postorder' in line.lower():
+                        recursion_found = True
+                    if recursion_found and ('append' in line.lower() or 'res.append' in line.lower()):
+                        # Check if this append comes after recursive calls
+                        root_append_after_calls = True
+                        break
+                
+                if not root_append_after_calls and recursion_found:
+                    return False, f"LOGICAL ERROR: Function '{func_name}' should perform POSTORDER traversal (Left->Right->Root). The root should be visited after both left and right subtrees."
+        
+        # === RECURSIVE FUNCTIONS WITH MISSING INCREMENTS ===
+        # Check for functions that should accumulate but don't
+        if any(keyword in func_name_lower for keyword in ['sum', 'count', 'size', 'length', 'depth']):
+            func_code = extract_function_code(code, func_name)
+            if func_code and func_name in func_code:  # Recursive function
+                # Check if return statement properly accumulates
+                if 'return' in func_code:
+                    return_lines = [l for l in func_code.split('\n') if 'return' in l.lower()]
+                    for ret_line in return_lines:
+                        # If it's a recursive call but doesn't add/subtract anything, might be wrong
+                        if func_name in ret_line and not any(op in ret_line for op in ['+', '-', '*', '/', 'max', 'min']):
+                            # This might be okay for some cases, but check context
+                            if 'sum' in func_name_lower or 'count' in func_name_lower:
+                                return False, f"LOGICAL ERROR: Function '{func_name}' appears to be recursive but the return statement doesn't accumulate values. For sum/count functions, you typically need to add the recursive result to the current value."
+    
+    return True, None
+
+def extract_function_code(code: str, func_name: str) -> Optional[str]:
+    """Extract the code body of a specific function."""
+    lines = code.split('\n')
+    func_start = None
+    func_indent = None
+    
+    # Find function definition
+    for i, line in enumerate(lines):
+        if re.match(r'\s*def\s+' + re.escape(func_name) + r'\s*\(', line):
+            func_start = i
+            func_indent = len(line) - len(line.lstrip())
+            break
+    
+    if func_start is None:
+        return None
+    
+    # Extract function body
+    func_lines = [lines[func_start]]
+    for i in range(func_start + 1, len(lines)):
+        line = lines[i]
+        if not line.strip():  # Empty line
+            func_lines.append(line)
+            continue
+        
+        line_indent = len(line) - len(line.lstrip())
+        
+        # If line is at same or less indentation and not empty, we've left the function
+        if line_indent <= func_indent and line.strip():
+            break
+        
+        func_lines.append(line)
+    
+    return '\n'.join(func_lines)
+
 def generate_line_edits(original: str, fixed: str) -> List[Dict[str, Any]]:
     """Generate structured line-by-line edit instructions."""
     orig_lines = original.splitlines()
@@ -736,7 +921,18 @@ def run_in_docker(code: str) -> ExecutionTrace:
             trace.logs = extract_logs_from_output(logs)
             
             if exit_code == 0:
-                trace.success = True
+                # Even if execution succeeded, check for logical errors
+                is_logically_correct, logical_error = validate_logical_correctness(code, logs)
+                
+                if is_logically_correct:
+                    trace.success = True
+                else:
+                    # Logical error detected - treat as failure
+                    trace.success = False
+                    trace.error_type = "LogicalError"
+                    trace.stack_trace = logical_error or "Logical correctness validation failed"
+                    # Append logical error to output for AI analysis
+                    trace.output = logs + "\n\n" + "="*50 + "\nLOGICAL ERROR DETECTED:\n" + "="*50 + "\n" + (logical_error or "Output does not match expected logical behavior")
             else:
                 trace.success = False
                 trace.error_type = parse_error_type(logs)
@@ -801,9 +997,72 @@ def apply_basic_fix(bad_code: str, error_log: str) -> tuple[str, str, str]:
             fixed_code = f"{var_name} = None  # Auto-defined\n{bad_code}"
     
     elif "IndentationError" in error_log or "unexpected indent" in error_log:
-        explanation = "Attempted to fix indentation issues"
-        reasoning = "Detected indentation error. Python requires consistent spacing. Normalizing to 4-space indentation."
-        fixed_code = bad_code.replace('\t', '    ')
+        explanation = "Fixed indentation by properly aligning code blocks"
+        reasoning = "Detected indentation error. Python requires consistent indentation. Fixed by ensuring class methods are indented under the class, while keeping module-level functions at module level."
+        
+        # Enhanced indentation fix that handles the common pattern
+        lines = bad_code.split('\n')
+        fixed_lines = []
+        in_class = False
+        in_method = False
+        prev_line_was_class = False
+        
+        for i, line in enumerate(lines):
+            stripped = line.lstrip()
+            current_indent = len(line) - len(stripped)
+            
+            # Empty line - preserve as is
+            if not stripped:
+                fixed_lines.append('')
+                prev_line_was_class = False
+                continue
+            
+            # Detect class definition
+            if stripped.startswith('class '):
+                fixed_lines.append(line)
+                in_class = True
+                in_method = False
+                prev_line_was_class = True
+                continue
+            
+            # Detect function/method definition
+            if stripped.startswith('def '):
+                if prev_line_was_class or (in_class and current_indent == 0):
+                    # Method definition not indented - fix it (4 spaces under class)
+                    fixed_lines.append('    ' + stripped)
+                    in_method = True
+                    in_class = True
+                elif in_class and current_indent >= 4:
+                    # Already properly indented method
+                    fixed_lines.append(line)
+                    in_method = True
+                else:
+                    # Module-level function (not in class)
+                    fixed_lines.append(line)
+                    in_class = False
+                    in_method = False
+                prev_line_was_class = False
+                continue
+            
+            # If we're in a class and see a line with 0 indentation that's not a def/class,
+            # and we're not in a method body, we've left the class
+            if in_class and not in_method and current_indent == 0 and not stripped.startswith('def ') and not stripped.startswith('class '):
+                in_class = False
+                in_method = False
+            
+            # Fix method body indentation (only if we're actually in a method)
+            if in_method and current_indent < 8 and 'self.' in stripped:
+                # Method body line needs proper indentation (8 spaces)
+                fixed_lines.append('        ' + stripped)
+            else:
+                # Preserve original line
+                fixed_lines.append(line)
+            
+            prev_line_was_class = False
+        
+        fixed_code = '\n'.join(fixed_lines)
+        # Normalize tabs to spaces
+        fixed_code = fixed_code.replace('\t', '    ')
     
     elif "SyntaxError" in error_log:
         explanation = "Syntax error detected - manual review recommended"
@@ -882,48 +1141,103 @@ def clean_code_string(code: str) -> str:
     return '\n'.join(lines)
 
 def get_ai_fix(bad_code: str, error_log: str) -> tuple[str, str, str, float]:
-    """Use Ollama LLM to fix broken code with full reasoning."""
+    """Use Ollama LLM to fix broken code with balanced reasoning."""
     start_time = time.time()
     
     try:
-        system_prompt = """You are an expert Python debugging assistant operating in a RESTRICTED DOCKER SANDBOX.
+        system_prompt = """You are a Senior Software Engineer and Algorithm Specialist.
 
-ENVIRONMENT CONSTRAINTS:
-- NO internet access
-- NO external libraries (numpy, pandas, requests, etc.)
-- ONLY Python Standard Library available
-- Memory limit: 128MB
-- Time limit: 5 seconds
+YOUR GOAL:
+Analyze the code not just for crashes, but for LOGICAL CORRECTNESS and ALGORITHMIC INTENT.
 
-YOUR TASK:
-1. Analyze the error and identify root cause
-2. Provide a COMPLETE, WORKING fix using ONLY standard library
-3. MAINTAIN THE SAME FUNCTIONALITY - do not simplify or remove logic
-4. Replace external library functions with standard library equivalents
-5. Explain your reasoning step-by-step
+CRITICAL INSTRUCTIONS:
 
-CRITICAL REQUIREMENTS:
-- Provide the ENTIRE corrected code, not just a partial fix
-- Preserve all original functionality and logic
-- Replace numpy functions with standard library:
-  * np.mean() → sum() / len()
-  * np.sum() → sum()
-  * np.array() → list()
-  * np.max() → max()
-  * np.min() → min()
-  * etc.
-- Replace pandas functions with standard library equivalents
-- Keep all variables, functions, and print statements intact
-- The fixed code must produce the same output as intended
+1. **Intent Analysis**: Look at function names, class names, and variable names. Treat these as the "Ground Truth" of what the user wants.
 
-RESPOND WITH ONLY A VALID JSON OBJECT:
+   **Tree Traversals:**
+   - 'preorder' → Root->Left->Right
+   - 'inorder' → Left->Root->Right
+   - 'postorder' → Left->Right->Root
+   - 'level_order' or 'bfs' → Level by level, left to right
+   
+   **Tree Operations:**
+   - 'height' → Must return max(left_height, right_height) + 1 (the +1 is CRITICAL for counting the current node)
+   - If a non-empty tree returns height 0, the function is missing the '+ 1' increment
+   - Tree height of a single node should be 1, not 0
+
+   **Stack Operations:**
+   - 'stack_push' → Add to top (LIFO)
+   - 'stack_pop' → Remove from top (LIFO)
+   - 'stack_peek' → View top without removing
+
+   **Queue Operations:**
+   - 'enqueue' or 'queue_add' → Add to rear (FIFO)
+   - 'dequeue' or 'queue_remove' → Remove from front (FIFO)
+
+   **Heap Operations:**
+   - 'heap_insert' → Insert maintaining heap property
+   - 'heap_extract_min' → Remove minimum (min-heap)
+   - 'heap_extract_max' → Remove maximum (max-heap)
+
+   **Search Algorithms:**
+   - 'binary_search' → O(log n) search on sorted array
+   - 'linear_search' → O(n) sequential search
+   - 'dfs' → Depth-first search (stack-based)
+   - 'bfs' → Breadth-first search (queue-based)
+
+   **Sorting Algorithms:**
+   - 'bubble_sort' → Compare adjacent elements, swap if needed
+   - 'quick_sort' → Partition and recursively sort
+   - 'merge_sort' → Divide, sort, merge
+   - 'heap_sort' → Build heap, extract elements
+
+   **Graph Algorithms:**
+   - 'dijkstra' → Shortest path from source
+   - 'topological_sort' → Order nodes with dependencies
+   - 'kruskal' → Minimum spanning tree (greedy)
+
+   **Data Structure Operations:**
+   - Linked List: Sequential access, no random indexing
+   - Array/List: Random access with indices
+   - Hash Table/Dict: Key-value pairs, O(1) average access
+   - Set: Unique elements, membership testing
+   - Tree: Hierarchical structure, parent-child relationships
+   - Graph: Nodes and edges, adjacency representation
+
+2. **Data Structure Check**: Ensure operations are compatible with the intended data structure.
+   - Don't access a Linked List like an Array (no random indexing)
+   - Don't use array indexing on a Set
+   - Ensure tree operations respect parent-child relationships
+   - Verify stack/queue operations follow LIFO/FIFO principles
+
+3. **Preserve Integrity**: 
+   - DO NOT delete assertions or test cases
+   - DO NOT remove imports unless strictly necessary
+   - DO NOT change variable names that indicate intent (e.g., 'stack', 'queue', 'heap')
+
+4. **Function Name Analysis - CRITICAL**:
+   - ALWAYS check the function name FIRST before analyzing the implementation
+   - The function name is the "contract" - the implementation MUST match what the name implies
+   - If function is named "height" but returns 0 for non-empty tree → Missing '+ 1' increment
+   - If function is named "preorder" but visits left before root → Wrong traversal order
+   - If function is named "inorder" but visits root before left → Wrong traversal order
+   - If function is named "postorder" but visits root before children → Wrong traversal order
+   - If function is named "sum" or "count" but doesn't accumulate recursive results → Missing accumulation
+   - MATCH THE IMPLEMENTATION TO THE FUNCTION NAME, not the other way around
+
+5. **Fix Strategy**:
+   - If there is a traceback, fix the crash
+   - If there is no crash but the logic contradicts the function/class name, FIX THE LOGIC
+   - If the algorithm doesn't match its name, correct it to match the intended algorithm
+   - If you see "LOGICAL ERROR" in error output, the code runs but produces wrong results - fix the logic to match the function name
+
+RESPOND WITH JSON ONLY:
+
 {
-    "explanation": "One sentence describing the bug and fix",
-    "fixed_code": "Complete corrected Python code (no markdown, no backticks, preserve all functionality)",
-    "reasoning": "Detailed step-by-step analysis of the problem and solution"
-}
-
-IMPORTANT: Return ONLY the JSON object, no additional text. The fixed_code must be complete and functional."""
+    "explanation": "Briefly explain the fix (e.g., 'Corrected traversal order to match preorder function name')",
+    "fixed_code": "The COMPLETE corrected Python code",
+    "reasoning": "Explain the mismatch between the intended algorithm and the implemented logic"
+}"""
 
         user_prompt = f"""BROKEN CODE:
 ```python
@@ -935,17 +1249,29 @@ ERROR OUTPUT:
 {error_log}
 ```
 
-CRITICAL INSTRUCTIONS:
-- Provide the COMPLETE fixed code that maintains ALL original functionality
-- Replace external library calls (like np.mean, np.sum, etc.) with standard library equivalents
-- Keep ALL variables, functions, print statements, and logic intact
-- The output should be the same as the original code intended
-- Do NOT simplify or remove functionality - only replace unavailable libraries
-
-Example: If code uses np.mean(numbers), replace with: sum(numbers) / len(numbers)
-Example: If code uses np.sum(array), replace with: sum(array)
-
-Return JSON only with the complete fixed code."""
+CRITICAL INSTRUCTIONS - READ CAREFULLY:
+- FUNCTION NAME IS THE CONTRACT: The function name tells you what it SHOULD do. Match the implementation to the name.
+- FIX ALL ISSUES AT ONCE: If you see multiple problems (indentation + logic), fix them all in one go.
+- PRESERVE STRUCTURE: Do NOT move functions into classes. If a function is defined at module level, keep it at module level.
+- INDENTATION ERRORS: Fix indentation/spacing. For class methods, indent 4 spaces under the class.
+- NAME-BASED VALIDATION: Always check function names and ensure implementation matches:
+  * "height" function → Must return max(left_height, right_height) + 1 (the +1 is CRITICAL)
+  * "preorder" function → Must visit root FIRST, then left, then right (Root->Left->Right)
+  * "inorder" function → Must visit left FIRST, then root, then right (Left->Root->Right)
+  * "postorder" function → Must visit left FIRST, then right, then root (Left->Right->Root)
+  * "sum"/"count" functions → Must accumulate recursive results (add/subtract recursive return values)
+- LOGICAL ERRORS: If you see "LOGICAL ERROR" in the error output, the code executes but produces wrong results. For example:
+  * Tree height function missing '+ 1': Should return max(left_height, right_height) + 1, not just max(left_height, right_height)
+  * If a non-empty tree returns height 0, the function is definitely missing the '+ 1' increment
+  * Traversal functions visiting nodes in wrong order → Fix order to match function name
+- DO NOT DELETE: Never delete class definitions, function definitions, or variable assignments. Fix them, don't remove them.
+- DO NOT CHANGE: Function locations, class structure, variable names (unless fixing logic errors).
+- DO NOT REPLACE: Do not replace the entire code with different code. Only fix the specific errors.
+- If you see 'ModuleNotFoundError' for numpy, replace ONLY the numpy function calls with standard library equivalents.
+- Do NOT add 'import numpy' or assume numpy exists.
+- Return the COMPLETE fixed code with EXACTLY the same structure, just with fixed indentation/syntax/logic.
+- The output must contain ALL the same classes, functions, and variables as the input.
+- FIX MULTIPLE ISSUES: If code has both syntax errors AND logic errors, fix both in the same response."""
         
         response = requests.post(
             "http://localhost:11434/api/generate",
@@ -970,6 +1296,31 @@ Return JSON only with the complete fixed code."""
                 
                 # Clean up code - comprehensive escape handling
                 fixed_code = clean_code_string(fixed_code)
+                
+                # VALIDATION: Check if AI returned completely different code
+                # Extract class and function names from original
+                original_classes = set(re.findall(r'\bclass\s+(\w+)', bad_code))
+                original_functions = set(re.findall(r'\bdef\s+(\w+)', bad_code))
+                fixed_classes = set(re.findall(r'\bclass\s+(\w+)', fixed_code))
+                fixed_functions = set(re.findall(r'\bdef\s+(\w+)', fixed_code))
+                
+                # Check if key identifiers are preserved
+                classes_preserved = len(original_classes & fixed_classes) if original_classes else True
+                functions_preserved = len(original_functions & fixed_functions) if original_functions else True
+                
+                # If classes or functions are missing, reject
+                if original_classes and not classes_preserved:
+                    exp, code, reason = apply_basic_fix(bad_code, error_log)
+                    return f"AI fix rejected (classes deleted) - {exp}", code, f"AI deleted class definitions. {reason}", ai_time
+                
+                if original_functions and not functions_preserved:
+                    exp, code, reason = apply_basic_fix(bad_code, error_log)
+                    return f"AI fix rejected (functions deleted) - {exp}", code, f"AI deleted function definitions. {reason}", ai_time
+                
+                # Check if code was deleted (too short compared to original)
+                if len(fixed_code.strip()) < len(bad_code.strip()) * 0.3:
+                    exp, code, reason = apply_basic_fix(bad_code, error_log)
+                    return f"AI fix rejected (too much code deleted) - {exp}", code, f"AI deleted too much code. {reason}", ai_time
                 
                 return explanation, fixed_code.strip(), reasoning, ai_time
             except json.JSONDecodeError:
